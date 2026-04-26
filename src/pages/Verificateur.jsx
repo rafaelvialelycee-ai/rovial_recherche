@@ -2,6 +2,7 @@ import { useState, useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { springAnim } from '../lib/animations'
 import { CheckCircle, XCircle, AlertCircle, Upload, Terminal, Download, Loader2 } from 'lucide-react'
+import { api } from '../lib/api'
 
 const gradientColors = 'bg-gradient-to-tr from-blue-500 via-cyan-400 to-indigo-500 dark:from-indigo-400 dark:via-purple-400 dark:to-blue-500'
 
@@ -14,16 +15,21 @@ const STEPS = [
     'Calcul du score de confiance…',
 ]
 
-function StatusBadge({ result }) {
-    if (!result) return null
-    const isValid   = result.includes('Valide')
-    const isInvalid = result.includes('Invalide')
-    const isWarn    = result.includes('Incertain') || result.includes('Bloqué') || result.includes('Greylisting')
+function formatResult(r) {
+    if (!r) return null
+    return `${r.statut} (${r.confiance}% | ${r.methode})`
+}
 
-    if (isValid)   return <span className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 text-sm font-bold border border-emerald-200 dark:border-emerald-800"><CheckCircle size={14}/> {result}</span>
-    if (isInvalid) return <span className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-red-500/10 text-red-600 dark:text-red-400 text-sm font-bold border border-red-200 dark:border-red-800"><XCircle size={14}/> {result}</span>
-    if (isWarn)    return <span className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-amber-500/10 text-amber-600 dark:text-amber-400 text-sm font-bold border border-amber-200 dark:border-amber-800"><AlertCircle size={14}/> {result}</span>
-    return <span className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 text-sm font-bold"><AlertCircle size={14}/> {result}</span>
+function StatusBadge({ statut, label }) {
+    if (!statut) return null
+    const isValid   = statut === 'Valide'
+    const isInvalid = statut === 'Invalide'
+    const isWarn    = statut === 'Incertain'
+
+    if (isValid)   return <span className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 text-sm font-bold border border-emerald-200 dark:border-emerald-800"><CheckCircle size={14}/> {label}</span>
+    if (isInvalid) return <span className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-red-500/10 text-red-600 dark:text-red-400 text-sm font-bold border border-red-200 dark:border-red-800"><XCircle size={14}/> {label}</span>
+    if (isWarn)    return <span className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-amber-500/10 text-amber-600 dark:text-amber-400 text-sm font-bold border border-amber-200 dark:border-amber-800"><AlertCircle size={14}/> {label}</span>
+    return <span className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 text-sm font-bold"><AlertCircle size={14}/> {label}</span>
 }
 
 function TerminalBlock({ steps, current, done }) {
@@ -52,21 +58,37 @@ export default function Verificateur() {
     const [step, setStep]       = useState(-1)
     const [done, setDone]       = useState(false)
     const [result, setResult]   = useState(null)
+    const [error, setError]     = useState(null)
     const [csvData, setCsvData] = useState(null)
     const [csvResult, setCsvResult] = useState([])
     const [csvProgress, setCsvProgress] = useState(0)
     const fileRef = useRef()
 
-    // Simulate the cascade verification (Python backend call placeholder)
     async function runVerification(emailToCheck) {
-        setRunning(true); setDone(false); setResult(null); setStep(0)
-        for (let i = 0; i < STEPS.length; i++) {
-            setStep(i)
-            await new Promise(r => setTimeout(r, 300 + Math.random() * 400))
+        setRunning(true); setDone(false); setResult(null); setError(null); setStep(0)
+
+        // Animation visuelle pendant l'appel réel
+        let stepInterval = 0
+        const ticker = setInterval(() => {
+            setStep(prev => {
+                if (prev < STEPS.length - 2) return prev + 1
+                clearInterval(ticker)
+                return prev
+            })
+        }, 600)
+
+        try {
+            const data = await api.verifier(emailToCheck)
+            clearInterval(ticker)
+            setStep(STEPS.length - 1)
+            await new Promise(r => setTimeout(r, 300))
+            setResult(data)
+        } catch (err) {
+            clearInterval(ticker)
+            setError(err.message)
+        } finally {
+            setDone(true); setRunning(false)
         }
-        // Placeholder result — plug your Python API here
-        const fakeResult = emailToCheck.includes('@') ? 'Valide (100% | API Simulée)' : 'Format Invalide'
-        setResult(fakeResult); setDone(true); setRunning(false)
     }
 
     function handleFileChange(e) {
@@ -82,36 +104,35 @@ export default function Verificateur() {
 
     async function runBulk() {
         if (!csvData) return
-        setRunning(true); setCsvResult([]); setCsvProgress(0)
-        const results = []
-        for (let i = 0; i < csvData.length; i++) {
-            const em = csvData[i]
-            await new Promise(r => setTimeout(r, 200 + Math.random() * 300))
-            const res = em.includes('@') ? 'Valide (simulation)' : 'Format Invalide'
-            results.push({ email: em, result: res })
-            setCsvResult([...results])
-            setCsvProgress(Math.round(((i + 1) / csvData.length) * 100))
+        setRunning(true); setCsvResult([]); setCsvProgress(0); setError(null)
+        try {
+            const data = await api.verifierBulk(csvData)
+            setCsvResult(data.resultats)
+            setCsvProgress(100)
+        } catch (err) {
+            setError(err.message)
+        } finally {
+            setRunning(false)
         }
-        setRunning(false)
     }
 
     function downloadCSV() {
         if (!csvResult.length) return
-        const csv = ['email;resultat', ...csvResult.map(r => `${r.email};${r.result}`)].join('\n')
+        const csv = ['email;statut;confiance;methode',
+            ...csvResult.map(r => `${r.email};${r.statut};${r.confiance}%;${r.methode}`)
+        ].join('\n')
         const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
         const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'export_verifie.csv'; a.click()
     }
 
     return (
         <div className="min-h-screen relative overflow-hidden">
-            {/* Background glow */}
             <div className="fixed inset-0 pointer-events-none z-0 overflow-hidden">
                 <motion.div animate={{ rotate: 360 }} transition={{ duration: 40, repeat: Infinity, ease: 'linear' }} style={{ willChange: 'transform' }}
                     className="absolute top-1/4 left-1/4 w-[500px] h-[500px] bg-blue-500/5 dark:bg-indigo-500/10 rounded-full blur-3xl" />
             </div>
 
             <div className="relative z-10 max-w-4xl mx-auto px-6 py-20">
-                {/* Header */}
                 <motion.div initial={{ opacity: 0, y: 30 }} animate={{ opacity: 1, y: 0 }} transition={{ ...springAnim }} className="mb-12">
                     <div className="inline-block border border-blue-500/20 dark:border-indigo-400/20 bg-blue-500/5 dark:bg-indigo-500/10 rounded-full px-5 py-2 text-[10px] font-bold text-blue-600 dark:text-indigo-400 mb-6 tracking-[0.25em] uppercase backdrop-blur-sm">
                         Module 01 · Validation
@@ -124,12 +145,11 @@ export default function Verificateur() {
                     </p>
                 </motion.div>
 
-                {/* Mode toggle */}
                 <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ ...springAnim, delay: 0.1 }}
                     className="flex gap-2 mb-8 p-1.5 bg-zinc-100 dark:bg-zinc-900 rounded-2xl w-fit"
                 >
                     {[['unit', 'Saisie unitaire'], ['bulk', 'Import fichier']].map(([m, label]) => (
-                        <button key={m} onClick={() => { setMode(m); setResult(null); setDone(false); setStep(-1) }}
+                        <button key={m} onClick={() => { setMode(m); setResult(null); setDone(false); setStep(-1); setError(null) }}
                             className={`px-5 py-2.5 rounded-xl text-sm font-bold transition-all duration-200 ${
                                 mode === m ? 'bg-white dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100 shadow-sm' : 'text-zinc-500 dark:text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300'
                             }`}
@@ -172,12 +192,20 @@ export default function Verificateur() {
                                         <TerminalBlock steps={STEPS} current={step} done={done} />
                                     </motion.div>
                                 )}
-                                {done && result && (
+                                {error && (
+                                    <motion.div key="error" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}
+                                        className="flex items-center gap-3 px-5 py-4 rounded-2xl bg-red-500/5 border border-red-200 dark:border-red-800 text-red-600 dark:text-red-400 text-sm font-semibold"
+                                    >
+                                        <XCircle size={16} className="shrink-0" />
+                                        {error}
+                                    </motion.div>
+                                )}
+                                {done && result && !error && (
                                     <motion.div key="result" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3 }}
                                         className="flex items-center gap-3"
                                     >
                                         <span className="text-xs font-bold uppercase tracking-widest text-zinc-400">Résultat :</span>
-                                        <StatusBadge result={result} />
+                                        <StatusBadge statut={result.statut} label={formatResult(result)} />
                                     </motion.div>
                                 )}
                             </AnimatePresence>
@@ -219,6 +247,13 @@ export default function Verificateur() {
                                 </div>
                             )}
 
+                            {error && (
+                                <div className="flex items-center gap-3 px-5 py-4 rounded-2xl bg-red-500/5 border border-red-200 dark:border-red-800 text-red-600 dark:text-red-400 text-sm font-semibold">
+                                    <XCircle size={16} className="shrink-0" />
+                                    {error}
+                                </div>
+                            )}
+
                             {csvResult.length > 0 && (
                                 <div className="space-y-3">
                                     <div className="flex items-center justify-between">
@@ -231,7 +266,7 @@ export default function Verificateur() {
                                         {csvResult.map((r, i) => (
                                             <div key={i} className="flex items-center justify-between px-4 py-3 bg-zinc-50 dark:bg-zinc-800/50 rounded-xl border border-zinc-100 dark:border-zinc-800">
                                                 <span className="text-sm font-mono text-zinc-700 dark:text-zinc-300 truncate max-w-[50%]">{r.email}</span>
-                                                <StatusBadge result={r.result} />
+                                                <StatusBadge statut={r.statut} label={`${r.statut} (${r.confiance}%)`} />
                                             </div>
                                         ))}
                                     </div>
