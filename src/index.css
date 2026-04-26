@@ -1,0 +1,43 @@
+@import "tailwindcss";
+
+@layer base {
+    :root {
+        color-scheme: light dark;
+    }
+
+    body {
+        @apply bg-[#fafafa] dark:bg-[#09090b] text-zinc-800 dark:text-zinc-200 antialiased;
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+    }
+
+    ::selection {
+        @apply bg-blue-500/20 text-blue-600 dark:bg-indigo-500/30 dark:text-indigo-200;
+    }
+}
+
+@layer utilities {
+    .animate-gradient-text {
+        background-size: 200% auto;
+        animation: gradient-move 8s ease-in-out infinite;
+    }
+
+    @keyframes gradient-move {
+        0%   { background-position: 0% 50%; }
+        50%  { background-position: 100% 50%; }
+        100% { background-position: 0% 50%; }
+    }
+
+    @keyframes marquee {
+        0%   { transform: translateX(0%); }
+        100% { transform: translateX(-50%); }
+    }
+
+    .animate-marquee {
+        animation: marquee 35s linear infinite;
+    }
+
+    .pause-on-hover:hover .animate-marquee {
+        animation-play-state: paused;
+    }
+}
