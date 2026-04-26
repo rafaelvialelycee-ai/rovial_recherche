@@ -5,6 +5,7 @@ import ScrollToTop from './ScrollToTop'
 
 import Navbar from './components/Navbar'
 import Footer from './components/Footer'
+import ErrorBoundary from './components/ErrorBoundary'
 
 const Home        = lazy(() => import('./pages/Home'))
 const Verificateur = lazy(() => import('./pages/Verificateur'))
@@ -51,7 +52,9 @@ export default function App() {
             <div className="flex flex-col min-h-screen">
                 <Navbar />
                 <main className="flex-grow flex flex-col">
-                    <AnimatedRoutes />
+                    <ErrorBoundary>
+                        <AnimatedRoutes />
+                    </ErrorBoundary>
                 </main>
                 <Footer />
             </div>
