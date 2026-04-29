@@ -1,42 +1,37 @@
-# =============================================================================
-# ROVIAL Recherche — API backend FastAPI
-# Exposer les moteurs de vérification et de recherche via une API REST.
-# Ce fichier remplace l'ancienne interface Streamlit par une architecture
-# découplée : le frontend React consomme cette API via fetch().
-# =============================================================================
-
 import os
+import time
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 from moteur_verif import verifier_email
-from moteur_chercheur import generer_patterns, deduire_format_dominant
+from moteur_chercheur import generer_patterns
 
-# ─── Rate Limiter ─────────────────────────────────────────────────────────────
+# ThreadPool partage pour la parallelisation
+_executor = ThreadPoolExecutor(max_workers=20)
+
 limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(
     title="ROVIAL Recherche API",
-    description="API d'enrichissement et de vérification B2B",
-    version="1.0.0",
+    description="API d'enrichissement et de verification B2B",
+    version="2.0.0",
 )
 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# ─── CORS ─────────────────────────────────────────────────────────────────────
-# En production, restreindre aux domaines autorisés via la variable d'env ALLOWED_ORIGINS
-# Exemple : ALLOWED_ORIGINS="https://rovial.fr,https://app.rovial.fr"
+# CORS
 _raw_origins = os.getenv("ALLOWED_ORIGINS", "")
 if _raw_origins:
     allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
 else:
-    # Fallback développement uniquement
     allowed_origins = ["http://localhost:5173", "http://localhost:3000"]
 
 app.add_middleware(
@@ -47,8 +42,7 @@ app.add_middleware(
 )
 
 
-# ─── Schémas ─────────────────────────────────────────────────────────────────
-
+# Schemas
 class EmailRequest(BaseModel):
     email: str
 
@@ -64,52 +58,66 @@ class BulkChercheurRequest(BaseModel):
     contacts: list[ChercheurRequest]
 
 
-# ─── Routes Vérificateur ─────────────────────────────────────────────────────
-
-@app.post("/api/verifier", summary="Vérifie un e-mail unique")
-@limiter.limit("30/minute")
+# Routes Verificateur
+@app.post("/api/verifier")
+@limiter.limit("60/minute")
 def verifier(request: Request, req: EmailRequest):
-    """
-    Vérifie l'existence réseau d'une adresse e-mail.
-    Retourne un objet avec statut, confiance (0-100), méthode et détail.
-    """
     return verifier_email(req.email)
 
 
-@app.post("/api/verifier/bulk", summary="Vérifie une liste d'e-mails")
+@app.post("/api/verifier/bulk")
 @limiter.limit("10/minute")
 def verifier_bulk(request: Request, req: BulkEmailRequest):
-    """Vérifie une liste d'e-mails en cascade."""
     if len(req.emails) > 500:
-        raise HTTPException(status_code=400, detail="Maximum 500 e-mails par requête.")
-    resultats = [verifier_email(email) for email in req.emails]
+        raise HTTPException(status_code=400, detail="Maximum 500 e-mails par requete.")
+
+    resultats = [None] * len(req.emails)
+    futures = {
+        _executor.submit(verifier_email, email): i
+        for i, email in enumerate(req.emails)
+    }
+    for future in as_completed(futures):
+        idx = futures[future]
+        try:
+            resultats[idx] = future.result()
+        except Exception as e:
+            resultats[idx] = {'email': req.emails[idx], 'statut': 'Erreur', 'confiance': 0, 'methode': 'Exception', 'detail': str(e)}
+
     return {"resultats": resultats, "total": len(resultats)}
 
 
-# ─── Routes Chercheur ────────────────────────────────────────────────────────
-
-@app.post("/api/chercher", summary="Déduit l'e-mail d'un contact")
-@limiter.limit("20/minute")
+# Routes Chercheur
+@app.post("/api/chercher")
+@limiter.limit("30/minute")
 def chercher(request: Request, req: ChercheurRequest):
-    """
-    Génère les patterns probables et tente de valider le premier.
-    Seul le statut 'Valide' est retourné comme résultat fiable.
-    'Incertain' est signalé séparément pour ne pas induire en erreur.
-    """
     patterns = generer_patterns(req.prenom, req.nom, req.domaine)
     if not patterns:
-        raise HTTPException(status_code=422, detail="Paramètres insuffisants.")
+        raise HTTPException(status_code=422, detail="Parametres insuffisants.")
 
+    # Paralleliser les 7 patterns simultanement
+    resultats_par_email: dict = {}
+    futures = {
+        _executor.submit(verifier_email, email): email
+        for email in patterns
+    }
+    for future in as_completed(futures):
+        email = futures[future]
+        try:
+            resultats_par_email[email] = future.result()
+        except Exception as e:
+            resultats_par_email[email] = {'email': email, 'statut': 'Erreur', 'confiance': 0, 'methode': 'Exception', 'detail': str(e)}
+
+    # Choisir le meilleur resultat en respectant l'ordre des patterns
     trouve_valide = None
     meilleur_incertain = None
-
     for email in patterns:
-        resultat = verifier_email(email)
-        if resultat['statut'] == 'Valide':
-            trouve_valide = resultat
-            break
-        elif resultat['statut'] == 'Incertain' and meilleur_incertain is None:
-            meilleur_incertain = resultat
+        r = resultats_par_email.get(email)
+        if not r:
+            continue
+        if r['statut'] == 'Valide' and trouve_valide is None:
+            trouve_valide = r
+        elif r['statut'] == 'Incertain' and meilleur_incertain is None:
+            meilleur_incertain = r
 
     return {
         "patterns": patterns,
@@ -120,47 +128,63 @@ def chercher(request: Request, req: ChercheurRequest):
     }
 
 
-@app.post("/api/chercher/bulk", summary="Enrichit une liste de contacts")
+@app.post("/api/chercher/bulk")
 @limiter.limit("5/minute")
 def chercher_bulk(request: Request, req: BulkChercheurRequest):
-    """Enrichit une liste de contacts avec leur e-mail déduit."""
     if len(req.contacts) > 200:
-        raise HTTPException(status_code=400, detail="Maximum 200 contacts par requête.")
+        raise HTTPException(status_code=400, detail="Maximum 200 contacts par requete.")
 
-    resultats = []
-    for contact in req.contacts:
+    def traiter_contact(contact):
         patterns = generer_patterns(contact.prenom, contact.nom, contact.domaine)
-        email_gagnant = None
-        statut_final = "Échec"
-        fiable = False
+        if not patterns:
+            return {"prenom": contact.prenom, "nom": contact.nom, "domaine": contact.domaine, "email": "Donnees insuffisantes", "statut": "Erreur", "fiable": False}
 
+        # Paralleliser les 7 patterns pour chaque contact
+        resultats_par_email: dict = {}
+        futures = {_executor.submit(verifier_email, e): e for e in patterns}
+        for future in as_completed(futures):
+            email = futures[future]
+            try:
+                resultats_par_email[email] = future.result()
+            except Exception:
+                resultats_par_email[email] = {'email': email, 'statut': 'Erreur', 'confiance': 0, 'methode': 'Exception', 'detail': ''}
+
+        trouve_valide = None
+        meilleur_incertain = None
         for email in patterns:
-            r = verifier_email(email)
-            if r['statut'] == 'Valide':
-                email_gagnant = r['email']
-                statut_final = f"Valide ({r['confiance']}% | {r['methode']})"
-                fiable = True
-                break
-            elif r['statut'] == 'Incertain' and email_gagnant is None:
-                # Garder comme fallback mais marquer non-fiable
-                email_gagnant = r['email']
-                statut_final = f"Incertain ({r['confiance']}% | {r['methode']})"
-                fiable = False
+            r = resultats_par_email.get(email, {})
+            if r.get('statut') == 'Valide' and not trouve_valide:
+                trouve_valide = r
+            elif r.get('statut') == 'Incertain' and not meilleur_incertain:
+                meilleur_incertain = r
 
-        resultats.append({
-            "prenom":  contact.prenom,
-            "nom":     contact.nom,
+        gagnant = trouve_valide or meilleur_incertain
+        return {
+            "prenom": contact.prenom,
+            "nom": contact.nom,
             "domaine": contact.domaine,
-            "email":   email_gagnant or "Non trouvé",
-            "statut":  statut_final,
-            "fiable":  fiable,
-        })
+            "email": gagnant['email'] if gagnant else "Non trouve",
+            "statut": gagnant['statut'] if gagnant else "Echec",
+            "fiable": trouve_valide is not None,
+        }
+
+    # Traiter tous les contacts en parallele (par batch de 10)
+    resultats = [None] * len(req.contacts)
+    contact_futures = {
+        _executor.submit(traiter_contact, contact): i
+        for i, contact in enumerate(req.contacts)
+    }
+    for future in as_completed(contact_futures):
+        idx = contact_futures[future]
+        try:
+            resultats[idx] = future.result()
+        except Exception as e:
+            c = req.contacts[idx]
+            resultats[idx] = {"prenom": c.prenom, "nom": c.nom, "domaine": c.domaine, "email": "Erreur", "statut": "Erreur", "fiable": False}
 
     return {"resultats": resultats, "total": len(resultats)}
 
 
-# ─── Health check ────────────────────────────────────────────────────────────
-
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "service": "ROVIAL Recherche API v1.0"}
+    return {"status": "ok", "service": "ROVIAL Recherche API v2.0"}
