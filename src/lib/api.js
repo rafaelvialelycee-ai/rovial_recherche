@@ -1,32 +1,47 @@
-// Point d'entrée unique pour les appels API.
-// Configurer VITE_API_URL dans .env (dev) ou dans les variables d'env de déploiement.
-// Exemple .env : VITE_API_URL=https://api.rovial.fr
-
 const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 
-async function request(path, body) {
+// Identifiant utilisateur temporaire (remplacer par JWT Supabase en prod)
+function getUserId() {
+    let uid = sessionStorage.getItem('rovial_uid')
+    if (!uid) {
+        uid = 'dev_' + Math.random().toString(36).slice(2, 10)
+        sessionStorage.setItem('rovial_uid', uid)
+    }
+    return uid
+}
+
+async function request(path, options = {}) {
     const res = await fetch(`${BASE_URL}${path}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+        headers: {
+            'Content-Type': 'application/json',
+            'X-User-Id': getUserId(),
+            ...options.headers,
+        },
+        ...options,
     })
 
+    if (res.status === 402) {
+        const data = await res.json()
+        // Dispatcher un event global pour que le modal crédits s'ouvre
+        window.dispatchEvent(new CustomEvent('rovial:credits_insuffisants', { detail: data.detail }))
+        throw new Error('credits_insuffisants')
+    }
+
     if (!res.ok) {
-        let message = `Erreur ${res.status}`
-        try {
-            const data = await res.json()
-            message = data?.detail || message
-        } catch {}
-        throw new Error(message)
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.detail || `Erreur ${res.status}`)
     }
 
     return res.json()
 }
 
 export const api = {
-    verifier:      (email)         => request('/api/verifier',        { email }),
-    verifierBulk:  (emails)        => request('/api/verifier/bulk',   { emails }),
-    chercher:      (prenom, nom, domaine) => request('/api/chercher', { prenom, nom, domaine }),
-    chercherBulk:  (contacts)      => request('/api/chercher/bulk',   { contacts }),
-    health:        ()              => fetch(`${BASE_URL}/api/health`).then(r => r.json()),
+    verifier:      (email)            => request('/api/verifier',        { method: 'POST', body: JSON.stringify({ email }) }),
+    verifierBulk:  (emails)           => request('/api/verifier/bulk',   { method: 'POST', body: JSON.stringify({ emails }) }),
+    chercher:      (prenom, nom, domaine, emails_connus = null) =>
+        request('/api/chercher', { method: 'POST', body: JSON.stringify({ prenom, nom, domaine, emails_connus }) }),
+    chercherBulk:  (contacts)         => request('/api/chercher/bulk',   { method: 'POST', body: JSON.stringify({ contacts }) }),
+    getCredits:    ()                  => request('/api/credits'),
+    getPlans:      ()                  => request('/api/plans'),
+    checkout:      (plan_id)           => request('/api/stripe/checkout', { method: 'POST', body: JSON.stringify({ plan_id }) }),
 }

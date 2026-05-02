@@ -6,11 +6,14 @@ import ScrollToTop from './ScrollToTop'
 import Navbar from './components/Navbar'
 import Footer from './components/Footer'
 import ErrorBoundary from './components/ErrorBoundary'
+import CreditsModal from './components/CreditsModal'
+import { CreditsProvider } from './lib/credits'
 
-const Home        = lazy(() => import('./pages/Home'))
+const Home         = lazy(() => import('./pages/Home'))
 const Verificateur = lazy(() => import('./pages/Verificateur'))
-const Chercheur   = lazy(() => import('./pages/Chercheur'))
-const NotFound    = lazy(() => import('./pages/NotFound'))
+const Chercheur    = lazy(() => import('./pages/Chercheur'))
+const Tarifs       = lazy(() => import('./pages/Tarifs'))
+const NotFound     = lazy(() => import('./pages/NotFound'))
 
 function PageSkeleton() {
     return (
@@ -34,10 +37,11 @@ function AnimatedRoutes() {
             >
                 <Suspense fallback={<PageSkeleton />}>
                     <Routes location={location}>
-                        <Route path="/"              element={<Home />} />
-                        <Route path="/verificateur"  element={<Verificateur />} />
-                        <Route path="/chercheur"     element={<Chercheur />} />
-                        <Route path="*"              element={<NotFound />} />
+                        <Route path="/"             element={<Home />} />
+                        <Route path="/verificateur" element={<Verificateur />} />
+                        <Route path="/chercheur"    element={<Chercheur />} />
+                        <Route path="/tarifs"       element={<Tarifs />} />
+                        <Route path="*"             element={<NotFound />} />
                     </Routes>
                 </Suspense>
             </motion.div>
@@ -48,16 +52,20 @@ function AnimatedRoutes() {
 export default function App() {
     return (
         <BrowserRouter>
-            <ScrollToTop />
-            <div className="flex flex-col min-h-screen">
-                <Navbar />
-                <main className="flex-grow flex flex-col">
-                    <ErrorBoundary>
-                        <AnimatedRoutes />
-                    </ErrorBoundary>
-                </main>
-                <Footer />
-            </div>
+            <CreditsProvider>
+                <ScrollToTop />
+                <div className="flex flex-col min-h-screen">
+                    <Navbar />
+                    <main className="flex-grow flex flex-col">
+                        <ErrorBoundary>
+                            <AnimatedRoutes />
+                        </ErrorBoundary>
+                    </main>
+                    <Footer />
+                </div>
+                {/* Modal global crédits insuffisants (déclenché par api.js 402) */}
+                <CreditsModal />
+            </CreditsProvider>
         </BrowserRouter>
     )
 }
