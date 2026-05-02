@@ -13,11 +13,11 @@ const STEPS_PATTERNS = [
     'Validation de la correspondance trouvée…',
 ]
 
-function ResultCard({ email, statut }) {
-    const isValid   = statut === 'Valide'
+function ResultCard({ email, statut, confiance, methode }) {
+    const isValid   = statut === 'Valide' || statut?.startsWith('Valide')
     const isInvalid = statut === 'Invalide'
     const isWarn    = statut === 'Incertain'
-    const isFound   = isValid || isWarn
+    const isError   = statut === 'Erreur' || statut === 'Non testé'
 
     return (
         <div className={`flex items-center justify-between px-5 py-4 rounded-2xl border transition-all ${
@@ -26,15 +26,20 @@ function ResultCard({ email, statut }) {
             isInvalid ? 'bg-red-500/5 border-red-200 dark:border-red-800' :
                         'bg-zinc-50 dark:bg-zinc-800/50 border-zinc-200 dark:border-zinc-700'
         }`}>
-            <span className="text-sm font-mono font-semibold text-zinc-800 dark:text-zinc-200">{email}</span>
+            <div className="flex flex-col gap-0.5">
+                <span className="text-sm font-mono font-semibold text-zinc-800 dark:text-zinc-200">{email}</span>
+                {methode && methode !== '-' && (
+                    <span className="text-[10px] text-zinc-400 dark:text-zinc-600">{methode}{confiance > 0 ? ` · ${confiance}%` : ''}</span>
+                )}
+            </div>
             <span className={`text-xs font-bold flex items-center gap-1 ${
                 isValid   ? 'text-emerald-600 dark:text-emerald-400' :
                 isWarn    ? 'text-amber-600 dark:text-amber-400' :
                 isInvalid ? 'text-red-500 dark:text-red-400' :
                             'text-zinc-400'
             }`}>
-                {isValid && <CheckCircle size={11}/>}
-                {isWarn  && <AlertCircle size={11}/>}
+                {isValid   && <CheckCircle size={11}/>}
+                {isWarn    && <AlertCircle size={11}/>}
                 {isInvalid && <XCircle size={11}/>}
                 {statut || 'Non testé'}
             </span>
@@ -50,12 +55,14 @@ export default function Chercheur() {
     const [running, setRunning] = useState(false)
     const [step, setStep]       = useState(-1)
     const [done, setDone]       = useState(false)
-    const [result, setResult]   = useState(null)   // { patterns, trouve, incertain, fiable }
+    const [result, setResult]   = useState(null)
     const [error, setError]     = useState(null)
     const [csvData, setCsvData] = useState(null)
     const [csvResult, setCsvResult] = useState([])
     const [csvProgress, setCsvProgress] = useState(0)
+    const [csvWarning, setCsvWarning] = useState(null)
     const fileRef = useRef()
+    const fakeIntervalRef = useRef(null)
 
     async function runSearch() {
         if (!prenom || !nom || !domaine) return
@@ -83,30 +90,64 @@ export default function Chercheur() {
         }
     }
 
+    // FIX #4 — Validation CSV : filtre lignes invalides + détection séparateur
     function handleFileChange(e) {
         const file = e.target.files[0]; if (!file) return
+        setCsvWarning(null)
         const reader = new FileReader()
         reader.onload = (ev) => {
-            const lines = ev.target.result.split('\n').map(l => l.trim()).filter(Boolean)
-            const parsed = lines.map(line => {
-                const parts = line.split(';')
-                return { prenom: parts[0] || '', nom: parts[1] || '', domaine: parts[2] || '' }
-            })
+            const raw = ev.target.result
+            const lines = raw.split('\n').map(l => l.trim()).filter(Boolean)
+
+            // Détecter le séparateur (point-virgule ou virgule)
+            const sep = lines[0]?.includes(';') ? ';' : ','
+
+            const parsed = lines
+                .map(line => {
+                    const parts = line.split(sep)
+                    return {
+                        prenom:  parts[0]?.trim() || '',
+                        nom:     parts[1]?.trim() || '',
+                        domaine: parts[2]?.trim() || '',
+                    }
+                })
+                .filter(c => c.prenom && c.nom && c.domaine)  // filtrer lignes incomplètes
+
+            const ignored = lines.length - parsed.length
+            if (ignored > 0) {
+                setCsvWarning(`${ignored} ligne(s) ignorée(s) car incomplètes (format attendu : prénom${sep}nom${sep}domaine.com).`)
+            }
+
+            if (parsed.length === 0) {
+                setCsvWarning(`Aucun contact valide trouvé. Vérifiez le format : prénom${sep}nom${sep}domaine.com`)
+                return
+            }
+
             setCsvData(parsed)
         }
         reader.readAsText(file)
     }
 
+    // FIX #5 — Fake progress bar animée pendant le bulk
     async function runBulk() {
         if (!csvData) return
         setRunning(true); setCsvResult([]); setCsvProgress(0); setError(null)
+
+        // Fake progress : monte jusqu'à 90% max, par paliers de 2% toutes les 400ms
+        let fakeP = 0
+        fakeIntervalRef.current = setInterval(() => {
+            fakeP = Math.min(fakeP + 2, 90)
+            setCsvProgress(fakeP)
+        }, 400)
+
         try {
             const data = await api.chercherBulk(csvData)
             setCsvResult(data.resultats)
-            setCsvProgress(100)
         } catch (err) {
             setError(err.message)
         } finally {
+            clearInterval(fakeIntervalRef.current)
+            setCsvProgress(100)
             setRunning(false)
         }
     }
@@ -120,13 +161,17 @@ export default function Chercheur() {
         const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'export_enrichi.csv'; a.click()
     }
 
-    // Construit un tableau de patterns avec leur statut réel depuis la réponse API
+    // FIX #1 — Utiliser resultats_detail retournés par l'API (vrais statuts pour chaque pattern)
     function buildPatternRows(data) {
+        if (data?.resultats_detail?.length) {
+            return data.resultats_detail
+        }
+        // Fallback legacy si l'API ancienne ne retourne pas resultats_detail
         if (!data?.patterns) return []
         return data.patterns.map(email => {
-            if (data.trouve?.email === email) return { email, statut: 'Valide' }
-            if (data.incertain?.email === email) return { email, statut: 'Incertain' }
-            return { email, statut: 'Invalide' }
+            if (data.trouve?.email === email)    return { email, statut: 'Valide',    confiance: data.trouve.confiance,    methode: data.trouve.methode }
+            if (data.incertain?.email === email) return { email, statut: 'Incertain', confiance: data.incertain.confiance, methode: data.incertain.methode }
+            return { email, statut: 'Non testé', confiance: 0, methode: '-' }
         })
     }
 
@@ -157,7 +202,7 @@ export default function Chercheur() {
                     className="flex gap-2 mb-8 p-1.5 bg-zinc-100 dark:bg-zinc-900 rounded-2xl w-fit"
                 >
                     {[['unit', 'Recherche unitaire'], ['bulk', 'Import fichier']].map(([m, label]) => (
-                        <button key={m} onClick={() => { setMode(m); setResult(null); setDone(false); setStep(-1); setError(null) }}
+                        <button key={m} onClick={() => { setMode(m); setResult(null); setDone(false); setStep(-1); setError(null); setCsvWarning(null) }}
                             className={`px-5 py-2.5 rounded-xl text-sm font-bold transition-all duration-200 ${
                                 mode === m ? 'bg-white dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100 shadow-sm' : 'text-zinc-500 dark:text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300'
                             }`}
@@ -179,6 +224,7 @@ export default function Chercheur() {
                                     <div key={label}>
                                         <label className="block text-xs font-bold uppercase tracking-widest text-zinc-400 dark:text-zinc-500 mb-2">{label}</label>
                                         <input value={val} onChange={e => set(e.target.value)}
+                                            onKeyDown={e => e.key === 'Enter' && runSearch()}
                                             placeholder={ph}
                                             className="w-full bg-zinc-50 dark:bg-zinc-800/50 border border-zinc-200 dark:border-zinc-700 rounded-2xl px-5 py-4 text-sm font-medium text-zinc-900 dark:text-zinc-100 placeholder-zinc-400 dark:placeholder-zinc-600 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500/50 transition-all"
                                         />
@@ -227,7 +273,7 @@ export default function Chercheur() {
                                         <span className="text-xs font-bold uppercase tracking-widest text-zinc-400">Patterns testés ({result.total_patterns})</span>
                                         <div className="grid grid-cols-1 gap-2">
                                             {buildPatternRows(result).map((row, i) => (
-                                                <ResultCard key={i} email={row.email} statut={row.statut} />
+                                                <ResultCard key={i} email={row.email} statut={row.statut} confiance={row.confiance} methode={row.methode} />
                                             ))}
                                         </div>
                                     </motion.div>
@@ -272,13 +318,19 @@ export default function Chercheur() {
                             className="border border-white/60 dark:border-zinc-800/50 bg-white/40 dark:bg-zinc-900/40 backdrop-blur-xl rounded-[2.5rem] p-10 space-y-8"
                         >
                             <div>
-                                <label className="block text-xs font-bold uppercase tracking-widest text-zinc-400 dark:text-zinc-500 mb-3">Fichier CSV (prenom;nom;domaine)</label>
+                                <label className="block text-xs font-bold uppercase tracking-widest text-zinc-400 dark:text-zinc-500 mb-3">Fichier CSV (prénom;nom;domaine ou prénom,nom,domaine)</label>
                                 <div onClick={() => fileRef.current?.click()} className="border-2 border-dashed border-zinc-200 dark:border-zinc-700 hover:border-indigo-400 dark:hover:border-indigo-600 rounded-2xl p-10 flex flex-col items-center gap-3 cursor-pointer transition-all group">
                                     <Upload size={24} className="text-zinc-400 group-hover:text-indigo-500 transition-colors" />
-                                    <span className="text-sm font-semibold text-zinc-500 dark:text-zinc-400">{csvData ? `${csvData.length} contacts chargés` : 'Cliquez pour importer'}</span>
-                                    <span className="text-xs text-zinc-400">Format attendu : prenom;nom;domaine.com</span>
+                                    <span className="text-sm font-semibold text-zinc-500 dark:text-zinc-400">{csvData ? `${csvData.length} contacts valides chargés` : 'Cliquez pour importer'}</span>
+                                    <span className="text-xs text-zinc-400">Séparateur auto-détecté : ; ou ,</span>
                                     <input ref={fileRef} type="file" accept=".csv,.txt" className="hidden" onChange={handleFileChange} />
                                 </div>
+                                {csvWarning && (
+                                    <div className="mt-3 flex items-start gap-2 text-xs text-amber-600 dark:text-amber-400 font-medium">
+                                        <AlertCircle size={13} className="shrink-0 mt-0.5" />
+                                        {csvWarning}
+                                    </div>
+                                )}
                             </div>
 
                             {csvData && (
@@ -290,14 +342,15 @@ export default function Chercheur() {
                                 </button>
                             )}
 
-                            {running && (
+                            {/* FIX #5 — Barre de progression animée (fake progress) */}
+                            {(running || csvProgress > 0) && csvProgress < 100 && (
                                 <div className="space-y-2">
                                     <div className="flex justify-between text-xs font-bold text-zinc-500">
                                         <span>Enrichissement en cours…</span>
                                         <span>{csvProgress}%</span>
                                     </div>
                                     <div className="h-1.5 bg-zinc-200 dark:bg-zinc-800 rounded-full overflow-hidden">
-                                        <motion.div className="h-full bg-gradient-to-r from-blue-500 to-indigo-500 rounded-full" animate={{ width: `${csvProgress}%` }} transition={{ duration: 0.3 }} />
+                                        <motion.div className="h-full bg-gradient-to-r from-blue-500 to-indigo-500 rounded-full" animate={{ width: `${csvProgress}%` }} transition={{ duration: 0.4 }} />
                                     </div>
                                 </div>
                             )}
@@ -323,7 +376,7 @@ export default function Chercheur() {
                                                 <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300">{r.prenom} {r.nom}</span>
                                                 <div className="flex items-center gap-2">
                                                     <span className="text-sm font-mono text-zinc-500 dark:text-zinc-400">{r.email}</span>
-                                                    {!r.fiable && r.email !== 'Non trouvé' && (
+                                                    {!r.fiable && r.email !== 'Non trouvé' && r.email !== 'Non trouve' && (
                                                         <span className="text-[10px] font-bold text-amber-500 bg-amber-500/10 border border-amber-200 dark:border-amber-800 px-2 py-0.5 rounded-full">Incertain</span>
                                                     )}
                                                 </div>
