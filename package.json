@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "dev:backend": "cd backend && uvicorn main:app --reload",
+    "dev:full": "concurrently \"npm run dev\" \"npm run dev:backend\""
   },
   "dependencies": {
     "@radix-ui/react-label": "^2.1.8",
@@ -35,3 +37,4 @@
     "vite": "^7.3.1"
   }
 }
+
