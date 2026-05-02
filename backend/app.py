@@ -21,7 +21,7 @@ limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(
     title="ROVIAL Recherche API",
     description="API d'enrichissement et de verification B2B",
-    version="2.0.0",
+    version="2.1.0",
 )
 
 app.state.limiter = limiter
@@ -94,7 +94,7 @@ def chercher(request: Request, req: ChercheurRequest):
     if not patterns:
         raise HTTPException(status_code=422, detail="Parametres insuffisants.")
 
-    # Paralleliser les 7 patterns simultanement
+    # FIX #1 — Paralleliser les 7 patterns et conserver TOUS les resultats detailles
     resultats_par_email: dict = {}
     futures = {
         _executor.submit(verifier_email, email): email
@@ -119,9 +119,16 @@ def chercher(request: Request, req: ChercheurRequest):
         elif r['statut'] == 'Incertain' and meilleur_incertain is None:
             meilleur_incertain = r
 
+    # FIX #1 — Retourner le detail complet de chaque pattern dans l'ordre
+    resultats_detail = [
+        resultats_par_email.get(email, {'email': email, 'statut': 'Non teste', 'confiance': 0, 'methode': '-', 'detail': ''})
+        for email in patterns
+    ]
+
     return {
         "patterns": patterns,
         "total_patterns": len(patterns),
+        "resultats_detail": resultats_detail,
         "trouve": trouve_valide,
         "incertain": meilleur_incertain,
         "fiable": trouve_valide is not None,
@@ -139,7 +146,6 @@ def chercher_bulk(request: Request, req: BulkChercheurRequest):
         if not patterns:
             return {"prenom": contact.prenom, "nom": contact.nom, "domaine": contact.domaine, "email": "Donnees insuffisantes", "statut": "Erreur", "fiable": False}
 
-        # Paralleliser les 7 patterns pour chaque contact
         resultats_par_email: dict = {}
         futures = {_executor.submit(verifier_email, e): e for e in patterns}
         for future in as_completed(futures):
@@ -168,7 +174,6 @@ def chercher_bulk(request: Request, req: BulkChercheurRequest):
             "fiable": trouve_valide is not None,
         }
 
-    # Traiter tous les contacts en parallele (par batch de 10)
     resultats = [None] * len(req.contacts)
     contact_futures = {
         _executor.submit(traiter_contact, contact): i
@@ -187,4 +192,4 @@ def chercher_bulk(request: Request, req: BulkChercheurRequest):
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "service": "ROVIAL Recherche API v2.0"}
+    return {"status": "ok", "service": "ROVIAL Recherche API v2.1"}
