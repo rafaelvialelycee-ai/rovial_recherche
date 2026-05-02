@@ -11,7 +11,7 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 from moteur_verif import verifier_email
-from moteur_chercheur import generer_patterns
+from moteur_chercheur import generer_patterns, deduire_format_dominant
 
 # ThreadPool partage pour la parallelisation
 _executor = ThreadPoolExecutor(max_workers=20)
@@ -21,7 +21,7 @@ limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(
     title="ROVIAL Recherche API",
     description="API d'enrichissement et de verification B2B",
-    version="2.1.0",
+    version="2.2.0",
 )
 
 app.state.limiter = limiter
@@ -53,9 +53,37 @@ class ChercheurRequest(BaseModel):
     prenom: str
     nom: str
     domaine: str
+    # FIX #8 — emails_connus optionnel : liste d'adresses connues du meme domaine
+    # pour detecter le format dominant et remonter le bon pattern en priorite
+    emails_connus: Optional[list[str]] = None
 
 class BulkChercheurRequest(BaseModel):
     contacts: list[ChercheurRequest]
+
+
+def _prioritiser_patterns(patterns: list[str], format_dominant: Optional[str]) -> list[str]:
+    """
+    FIX #8 — Remonte en tete de liste le pattern correspondant au format dominant detecte.
+    Les autres patterns sont conserves dans leur ordre statistique original.
+    """
+    if not format_dominant:
+        return patterns
+
+    FORMAT_VERS_INDEX = {
+        'prenom.nom': 0,  # prenom.nom@
+        'pnom':       1,  # pnom@
+        'prenom':     2,  # prenom@
+        'p.nom':      3,  # p.nom@
+    }
+
+    idx_dominant = FORMAT_VERS_INDEX.get(format_dominant)
+    if idx_dominant is None or idx_dominant >= len(patterns):
+        return patterns
+
+    # Remonter le pattern dominant en position 0, conserver le reste dans l'ordre
+    pattern_dominant = patterns[idx_dominant]
+    reordonnes = [pattern_dominant] + [p for i, p in enumerate(patterns) if i != idx_dominant]
+    return reordonnes
 
 
 # Routes Verificateur
@@ -90,11 +118,19 @@ def verifier_bulk(request: Request, req: BulkEmailRequest):
 @app.post("/api/chercher")
 @limiter.limit("30/minute")
 def chercher(request: Request, req: ChercheurRequest):
-    patterns = generer_patterns(req.prenom, req.nom, req.domaine)
-    if not patterns:
+    patterns_bruts = generer_patterns(req.prenom, req.nom, req.domaine)
+    if not patterns_bruts:
         raise HTTPException(status_code=422, detail="Parametres insuffisants.")
 
-    # FIX #1 — Paralleliser les 7 patterns et conserver TOUS les resultats detailles
+    # FIX #8 — Si des emails connus sont fournis, detecter le format dominant
+    # et remonter ce pattern en priorite avant de paralleliser
+    format_dominant = None
+    if req.emails_connus:
+        format_dominant = deduire_format_dominant(req.emails_connus)
+
+    patterns = _prioritiser_patterns(patterns_bruts, format_dominant)
+
+    # Paralleliser tous les patterns simultanement
     resultats_par_email: dict = {}
     futures = {
         _executor.submit(verifier_email, email): email
@@ -107,7 +143,7 @@ def chercher(request: Request, req: ChercheurRequest):
         except Exception as e:
             resultats_par_email[email] = {'email': email, 'statut': 'Erreur', 'confiance': 0, 'methode': 'Exception', 'detail': str(e)}
 
-    # Choisir le meilleur resultat en respectant l'ordre des patterns
+    # Choisir le meilleur resultat en respectant l'ordre (dominant en tete si detecte)
     trouve_valide = None
     meilleur_incertain = None
     for email in patterns:
@@ -119,7 +155,7 @@ def chercher(request: Request, req: ChercheurRequest):
         elif r['statut'] == 'Incertain' and meilleur_incertain is None:
             meilleur_incertain = r
 
-    # FIX #1 — Retourner le detail complet de chaque pattern dans l'ordre
+    # Retourner le detail complet de chaque pattern dans l'ordre final
     resultats_detail = [
         resultats_par_email.get(email, {'email': email, 'statut': 'Non teste', 'confiance': 0, 'methode': '-', 'detail': ''})
         for email in patterns
@@ -129,6 +165,7 @@ def chercher(request: Request, req: ChercheurRequest):
         "patterns": patterns,
         "total_patterns": len(patterns),
         "resultats_detail": resultats_detail,
+        "format_dominant_detecte": format_dominant,
         "trouve": trouve_valide,
         "incertain": meilleur_incertain,
         "fiable": trouve_valide is not None,
@@ -142,9 +179,15 @@ def chercher_bulk(request: Request, req: BulkChercheurRequest):
         raise HTTPException(status_code=400, detail="Maximum 200 contacts par requete.")
 
     def traiter_contact(contact):
-        patterns = generer_patterns(contact.prenom, contact.nom, contact.domaine)
-        if not patterns:
+        patterns_bruts = generer_patterns(contact.prenom, contact.nom, contact.domaine)
+        if not patterns_bruts:
             return {"prenom": contact.prenom, "nom": contact.nom, "domaine": contact.domaine, "email": "Donnees insuffisantes", "statut": "Erreur", "fiable": False}
+
+        # FIX #8 — Appliquer aussi le format dominant en bulk si emails_connus fournis
+        format_dominant = None
+        if contact.emails_connus:
+            format_dominant = deduire_format_dominant(contact.emails_connus)
+        patterns = _prioritiser_patterns(patterns_bruts, format_dominant)
 
         resultats_par_email: dict = {}
         futures = {_executor.submit(verifier_email, e): e for e in patterns}
@@ -172,6 +215,7 @@ def chercher_bulk(request: Request, req: BulkChercheurRequest):
             "email": gagnant['email'] if gagnant else "Non trouve",
             "statut": gagnant['statut'] if gagnant else "Echec",
             "fiable": trouve_valide is not None,
+            "format_dominant": format_dominant,
         }
 
     resultats = [None] * len(req.contacts)
@@ -192,4 +236,4 @@ def chercher_bulk(request: Request, req: BulkChercheurRequest):
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "service": "ROVIAL Recherche API v2.1"}
+    return {"status": "ok", "service": "ROVIAL Recherche API v2.2"}
