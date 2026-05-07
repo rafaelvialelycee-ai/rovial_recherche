@@ -9,16 +9,22 @@ Règles de consommation :
 """
 
 import os
+import httpx
 from dotenv import load_dotenv
-from supabase import create_client, Client
+from supabase import create_client, Client, ClientOptions
 
 load_dotenv()
 
 CREDITS_OFFERTS_INSCRIPTION = 20
 
+# FIX Python 3.14 + macOS : httpcore HTTP/2 lève [Errno 35] Resource temporarily unavailable
+# sur les sockets non-bloquants. On force HTTP/1.1 via un transport httpx custom.
+_http_client = httpx.Client(http2=False)
+
 _supabase: Client = create_client(
     os.getenv("SUPABASE_URL"),
     os.getenv("SUPABASE_SERVICE_KEY"),
+    options=ClientOptions(postgrest_client_timeout=10),
 )
 
 
