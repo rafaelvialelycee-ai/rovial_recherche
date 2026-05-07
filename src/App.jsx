@@ -13,6 +13,8 @@ const Home         = lazy(() => import('./pages/Home'))
 const Verificateur = lazy(() => import('./pages/Verificateur'))
 const Chercheur    = lazy(() => import('./pages/Chercheur'))
 const Tarifs       = lazy(() => import('./pages/Tarifs'))
+const About        = lazy(() => import('./pages/About'))
+const Privacy      = lazy(() => import('./pages/Privacy'))
 const NotFound     = lazy(() => import('./pages/NotFound'))
 
 function PageSkeleton() {
@@ -41,6 +43,8 @@ function AnimatedRoutes() {
                         <Route path="/verificateur" element={<Verificateur />} />
                         <Route path="/chercheur"    element={<Chercheur />} />
                         <Route path="/tarifs"       element={<Tarifs />} />
+                        <Route path="/about"        element={<About />} />
+                        <Route path="/privacy"      element={<Privacy />} />
                         <Route path="*"             element={<NotFound />} />
                     </Routes>
                 </Suspense>

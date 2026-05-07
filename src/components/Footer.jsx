@@ -21,6 +21,8 @@ export default function Footer() {
                 <div className="flex items-center gap-6 text-xs font-semibold text-zinc-400 dark:text-zinc-500 tracking-widest uppercase">
                     <Link to="/verificateur" className="hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors">Vérificateur</Link>
                     <Link to="/chercheur"    className="hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors">Chercheur</Link>
+                    <Link to="/about"        className="hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors">À propos</Link>
+                    <Link to="/privacy"      className="hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors">Confidentialité</Link>
                     <a href="https://rovial.fr" target="_blank" rel="noopener noreferrer" className="hover:text-indigo-500 transition-colors">rovial.fr ↗</a>
                 </div>
 
