@@ -6,38 +6,35 @@ import random
 import string
 import requests
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
-import functools
 
 # ── Cache DNS (TTL 1h) ────────────────────────────────────────────────────────
-_dns_cache: dict = {}   # { domaine: (serveur_mx, timestamp) }
+_dns_cache: dict = {}
 DNS_CACHE_TTL = 3600
 
 # ── Cache Sniper par domaine (TTL 10 min) ─────────────────────────────────────
-# Evite de re-mesurer duree_faux sur le meme serveur OVH en bulk
 # { domaine: (duree_faux_ref, timestamp) }
 _sniper_cache: dict = {}
-SNIPER_CACHE_TTL = 600   # 10 minutes
+SNIPER_CACHE_TTL = 600
 
 resolver = dns.resolver.Resolver()
 resolver.nameservers = ['8.8.8.8', '1.1.1.1']
 resolver.timeout = 2
 resolver.lifetime = 2
 
-SMTP_TIMEOUT           = 6
+SMTP_TIMEOUT           = 8
 SNIPER_DELTA_VALIDE    = 0.5
 SNIPER_DELTA_INCERTAIN = 0.2
-# FIX #1 — seuil delta negatif : en dessous de -0.15s le serveur a rejecte
-# l'adresse reelle AVANT de chercher => signal Invalide tres fiable
-SNIPER_DELTA_NEGATIF   = -0.15
+# Seuil delta negatif abaisse a -0.4s pour absorber la variance warm-up TCP.
+# Un delta entre -0.4s et 0 est un signal trop faible => Incertain.
+# En dessous de -0.4s : rejet interne avere => Invalide.
+SNIPER_DELTA_NEGATIF   = -0.4
 
 MOTS_GENERIQUES = {
     'contact', 'info', 'hello', 'bonjour', 'admin',
     'support', 'webmaster', 'direction', 'noreply', 'no-reply'
 }
 
-# Codes SMTP temporaires (serveur sature, greylisting)
 CODES_TEMPORAIRES = {421, 450, 451, 452}
-# Codes SMTP de rejet definitif
 CODES_REJET       = {550, 551, 552, 553, 554}
 
 
@@ -67,7 +64,7 @@ def verifier_via_api_microsoft(email: str) -> bool | None:
         if code == 0:
             return True
         if code == 1:
-            return None  # tenant prive, laisser SMTP trancher
+            return None
     except Exception:
         pass
     return None
@@ -106,44 +103,69 @@ def _ping_smtp_interne(serveur_mx: str, email_cible: str) -> tuple:
         return None, None, str(e)
 
 
+def _ping_smtp_dual(serveur_mx: str, email_cible: str, domaine: str) -> tuple:
+    """
+    FIX warm-up TCP : mesure faux ET vrai dans la MEME session SMTP ouverte a froid.
+    On envoie d'abord RCPT TO faux (pour absorber le warm-up), puis RCPT TO vrai
+    dans la meme connexion. Les deux mesures sont donc sur le meme plan thermique.
+    Retourne (code_faux, duree_faux, code_vrai, duree_vrai, erreur).
+    """
+    faux_email = generer_faux_email(domaine)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            future = ex.submit(_ping_dual_interne, serveur_mx, faux_email, email_cible)
+            return future.result(timeout=SMTP_TIMEOUT * 2 + 2)
+    except (FuturesTimeout, Exception) as e:
+        return None, None, None, None, str(e)
+
+
+def _ping_dual_interne(serveur_mx: str, faux_email: str, email_cible: str) -> tuple:
+    """Ouvre une connexion SMTP et mesure successivement faux puis vrai."""
+    try:
+        serveur = smtplib.SMTP(timeout=SMTP_TIMEOUT)
+        serveur.connect(serveur_mx)
+        serveur.helo('verify.rovial.fr')
+        serveur.mail('noreply@rovial.fr')
+
+        # Mesure faux
+        t0 = time.perf_counter()
+        code_faux, _ = serveur.rcpt(faux_email)
+        duree_faux = time.perf_counter() - t0
+
+        # RSET pour remettre la session en etat MAIL (certains serveurs l'exigent)
+        try:
+            serveur.rset()
+            serveur.mail('noreply@rovial.fr')
+        except Exception:
+            pass
+
+        # Mesure vrai
+        t1 = time.perf_counter()
+        code_vrai, _ = serveur.rcpt(email_cible)
+        duree_vrai = time.perf_counter() - t1
+
+        try:
+            serveur.quit()
+        except Exception:
+            pass
+
+        return code_faux, duree_faux, code_vrai, duree_vrai, "OK"
+
+    except smtplib.SMTPConnectError as e:
+        return None, None, None, None, f"Connexion refusee: {e}"
+    except smtplib.SMTPServerDisconnected as e:
+        return None, None, None, None, f"Deconnexion: {e}"
+    except socket.timeout:
+        return None, None, None, None, "Timeout SMTP"
+    except Exception as e:
+        return None, None, None, None, str(e)
+
+
 def _marquer_generique(email: str, statut: str) -> str:
     prefixe = email.split('@')[0]
     if prefixe.lower() in MOTS_GENERIQUES:
         return f"{statut} (Adresse generique)"
     return statut
-
-
-def _ping_smtp_moyenne(serveur_mx: str, email: str, essais: int = 2) -> tuple:
-    durees = []
-    dernier_code = None
-    for _ in range(essais):
-        code, duree, err = ping_smtp_rapide(serveur_mx, email)
-        if code is not None and duree is not None:
-            durees.append(duree)
-            dernier_code = code
-    if not durees:
-        return None, None, "Tous les pings ont echoue"
-    return sum(durees) / len(durees), dernier_code, "OK"
-
-
-def _obtenir_duree_faux_ref(serveur_mx: str, domaine: str) -> tuple:
-    """
-    FIX #3 — Cache Sniper par domaine.
-    Retourne (duree_faux_ref, depuis_cache).
-    On mesure le faux email UNE SEULE FOIS par domaine sur 10 min.
-    Evite 50 requetes inutiles sur le meme serveur OVH en bulk.
-    """
-    cached = _sniper_cache.get(domaine)
-    if cached and time.time() - cached[1] < SNIPER_CACHE_TTL:
-        return cached[0], True
-
-    faux_email = generer_faux_email(domaine)
-    code_faux, duree_faux, err_smtp = ping_smtp_rapide(serveur_mx, faux_email)
-    if code_faux == 250 and duree_faux is not None:
-        _sniper_cache[domaine] = (duree_faux, time.time())
-        return duree_faux, False
-    # Retourner le code et duree tels quels pour traitement en amont
-    return (code_faux, duree_faux, err_smtp), False
 
 
 def verifier_email(email_brut: str) -> dict:
@@ -158,81 +180,80 @@ def verifier_email(email_brut: str) -> dict:
     if not serveur_mx:
         return {'email': email, 'statut': 'Erreur', 'confiance': 0, 'methode': 'DNS', 'detail': erreur_dns}
 
-    # Etape 2 : API Microsoft (Office 365 / Outlook)
+    # Etape 2 : API Microsoft
     if 'protection.outlook.com' in serveur_mx.lower() or 'outlook' in serveur_mx.lower():
         resultat_api = verifier_via_api_microsoft(email)
         if resultat_api is True:
             s = _marquer_generique(email, 'Valide')
             return {'email': email, 'statut': s, 'confiance': 100, 'methode': 'API Microsoft', 'detail': 'Compte confirme'}
 
-    # Etape 3 : Faux email / detection catch-all
-    # On utilise le cache Sniper pour ne pas re-mesurer sur le meme domaine
-    cache_result = _sniper_cache.get(domaine)
-    if cache_result and time.time() - cache_result[1] < SNIPER_CACHE_TTL:
-        # Cache hit : on a deja la duree de reference, on fait juste le ping reel
-        duree_faux = cache_result[0]
-        # On a besoin du code faux pour savoir si catch-all
-        # On refait un ping faux leger pour obtenir le code (rapide, serveur deja connu)
-        faux_email = generer_faux_email(domaine)
-        code_faux, _, err_smtp = ping_smtp_rapide(serveur_mx, faux_email)
-    else:
-        faux_email = generer_faux_email(domaine)
-        code_faux, duree_faux, err_smtp = ping_smtp_rapide(serveur_mx, faux_email)
+    # Etape 3 : Ping simple pour detecter le comportement du serveur (catch-all ou non)
+    # On fait un seul ping faux pour savoir le code retourne
+    faux_email_sonde = generer_faux_email(domaine)
+    code_sonde, _, err_sonde = ping_smtp_rapide(serveur_mx, faux_email_sonde)
 
-    if code_faux is None:
-        return {'email': email, 'statut': 'Incertain', 'confiance': 30, 'methode': 'SMTP', 'detail': f'Serveur inaccessible ou trop lent: {err_smtp}'}
+    if code_sonde is None:
+        return {'email': email, 'statut': 'Incertain', 'confiance': 30, 'methode': 'SMTP', 'detail': f'Serveur inaccessible ou trop lent: {err_sonde}'}
 
-    # FIX #2 — Codes SMTP specifiques
-    if code_faux in CODES_TEMPORAIRES:
-        return {'email': email, 'statut': 'Incertain', 'confiance': 70, 'methode': 'SMTP', 'detail': f'Code temporaire {code_faux} (greylisting / surcharge serveur)'}
+    # Codes temporaires
+    if code_sonde in CODES_TEMPORAIRES:
+        return {'email': email, 'statut': 'Incertain', 'confiance': 70, 'methode': 'SMTP', 'detail': f'Code temporaire {code_sonde} (greylisting / surcharge serveur)'}
 
-    if code_faux in CODES_REJET or code_faux == 550:
-        # Serveur rejette les inconnus => pas catch-all => test direct
+    # Serveur rejette les inconnus => pas catch-all => test direct classique
+    if code_sonde in CODES_REJET:
         code_vrai, _, _ = ping_smtp_rapide(serveur_mx, email)
         if code_vrai == 250:
             s = _marquer_generique(email, 'Valide')
-            return {'email': email, 'statut': s, 'confiance': 100, 'methode': 'SMTP Classique', 'detail': f'RCPT TO 250 (faux={code_faux})'}
+            return {'email': email, 'statut': s, 'confiance': 100, 'methode': 'SMTP Classique', 'detail': f'RCPT TO 250 (faux={code_sonde})'}
         if code_vrai in CODES_REJET:
             return {'email': email, 'statut': 'Invalide', 'confiance': 0, 'methode': 'SMTP Classique', 'detail': f'RCPT TO rejete ({code_vrai})'}
-        # 554 specifique : rejet permanent non-conformite
         if code_vrai == 554:
             return {'email': email, 'statut': 'Invalide', 'confiance': 0, 'methode': 'SMTP Classique', 'detail': 'Rejet permanent 554'}
         return {'email': email, 'statut': 'Incertain', 'confiance': 40, 'methode': 'SMTP Classique', 'detail': f'Code inattendu: {code_vrai}'}
 
-    # Etape 4 : Sniper de latence (catch-all detecte, code_faux == 250)
-    if code_faux == 250:
-        # Mise en cache de la duree de reference si pas encore fait
-        if not (cache_result and time.time() - cache_result[1] < SNIPER_CACHE_TTL):
-            if duree_faux is not None:
-                _sniper_cache[domaine] = (duree_faux, time.time())
+    # Etape 4 : Catch-all detecte (code_sonde == 250)
+    # On utilise le ping DUAL dans la meme session pour eliminer le biais warm-up TCP
+    if code_sonde == 250:
+        code_faux, duree_faux, code_vrai, duree_vrai, err_dual = _ping_smtp_dual(serveur_mx, email, domaine)
 
-        if duree_faux is None:
-            return {'email': email, 'statut': 'Incertain', 'confiance': 20, 'methode': 'SMTP Sniper', 'detail': 'Duree faux non disponible'}
+        if code_faux is None or duree_faux is None:
+            return {'email': email, 'statut': 'Incertain', 'confiance': 20, 'methode': 'SMTP Sniper', 'detail': f'Session dual echouee: {err_dual}'}
 
-        duree_vrai_moy, code_vrai, err2 = _ping_smtp_moyenne(serveur_mx, email, essais=2)
-        if duree_vrai_moy is None:
-            return {'email': email, 'statut': 'Incertain', 'confiance': 20, 'methode': 'SMTP Sniper', 'detail': f'Erreur: {err2}'}
+        # Mise en cache de duree_faux pour le bulk (protection anti-blacklist)
+        _sniper_cache[domaine] = (duree_faux, time.time())
 
-        delta = duree_vrai_moy - duree_faux
+        if code_vrai is None or duree_vrai is None:
+            return {'email': email, 'statut': 'Incertain', 'confiance': 20, 'methode': 'SMTP Sniper', 'detail': 'Ping vrai echoue dans session dual'}
 
-        # FIX #1 — Delta negatif fort = rejet interne avant lookup => Invalide
+        delta = duree_vrai - duree_faux
+
+        # Delta tres negatif : rejet interne avere MEME dans la meme session
         if delta <= SNIPER_DELTA_NEGATIF:
             return {
                 'email': email,
                 'statut': 'Invalide',
                 'confiance': 0,
                 'methode': 'Sniper',
-                'detail': f'Delta negatif ({delta:.2f}s) : rejet interne serveur'
+                'detail': f'Delta negatif fort ({delta:.3f}s) : rejet interne serveur'
+            }
+
+        # Delta entre -0.4s et 0 : signal faible, on ne conclut pas Invalide
+        if delta < 0:
+            return {
+                'email': email,
+                'statut': 'Incertain',
+                'confiance': 20,
+                'methode': 'Sniper',
+                'detail': f'Delta negatif faible ({delta:.3f}s) : variance reseau'
             }
 
         if delta >= SNIPER_DELTA_VALIDE:
             s = _marquer_generique(email, 'Valide')
-            return {'email': email, 'statut': s, 'confiance': 90, 'methode': 'Sniper', 'detail': f'Delta moy: +{delta:.2f}s'}
+            return {'email': email, 'statut': s, 'confiance': 90, 'methode': 'Sniper', 'detail': f'Delta: +{delta:.3f}s'}
 
         if delta >= SNIPER_DELTA_INCERTAIN:
-            return {'email': email, 'statut': 'Incertain', 'confiance': 50, 'methode': 'Sniper', 'detail': f'Delta moy: +{delta:.2f}s'}
+            return {'email': email, 'statut': 'Incertain', 'confiance': 50, 'methode': 'Sniper', 'detail': f'Delta: +{delta:.3f}s'}
 
-        # Delta entre SNIPER_DELTA_NEGATIF et SNIPER_DELTA_INCERTAIN : signal trop faible
-        return {'email': email, 'statut': 'Incertain', 'confiance': 0, 'methode': 'Sniper', 'detail': f'Delta insuffisant: {delta:.2f}s'}
+        return {'email': email, 'statut': 'Incertain', 'confiance': 0, 'methode': 'Sniper', 'detail': f'Delta insuffisant: {delta:.3f}s'}
 
-    return {'email': email, 'statut': 'Incertain', 'confiance': 0, 'methode': 'Inconnu', 'detail': f'Code SMTP inattendu: {code_faux}'}
+    return {'email': email, 'statut': 'Incertain', 'confiance': 0, 'methode': 'Inconnu', 'detail': f'Code SMTP inattendu: {code_sonde}'}
