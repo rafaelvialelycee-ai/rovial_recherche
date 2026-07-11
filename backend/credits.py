@@ -9,7 +9,6 @@ Règles de consommation :
 """
 
 import os
-import httpx
 from dotenv import load_dotenv
 from supabase import create_client, Client, ClientOptions
 
@@ -17,20 +16,30 @@ load_dotenv()
 
 CREDITS_OFFERTS_INSCRIPTION = 20
 
-# FIX Python 3.14 + macOS : httpcore HTTP/2 lève [Errno 35] Resource temporarily unavailable
-# sur les sockets non-bloquants. On force HTTP/1.1 via un transport httpx custom.
-_http_client = httpx.Client(http2=False)
+_supabase_client: Client | None = None
 
-_supabase: Client = create_client(
-    os.getenv("SUPABASE_URL"),
-    os.getenv("SUPABASE_SERVICE_KEY"),
-    options=ClientOptions(postgrest_client_timeout=10),
-)
+def _get_client() -> Client | None:
+    """Lazy init : instancie le client Supabase au premier appel. Retourne None si les vars manquent."""
+    global _supabase_client
+    if _supabase_client is not None:
+        return _supabase_client
+    url = os.getenv("SUPABASE_URL")
+    key = os.getenv("SUPABASE_SERVICE_KEY")
+    if not url or not key:
+        return None
+    _supabase_client = create_client(url, key, options=ClientOptions(postgrest_client_timeout=10))
+    return _supabase_client
 
 
 def _get_row(user_id: str) -> dict | None:
-    res = _supabase.table("credits").select("*").eq("user_id", user_id).single().execute()
-    return res.data
+    sb = _get_client()
+    if sb is None:
+        return None
+    try:
+        res = sb.table("credits").select("*").eq("user_id", user_id).single().execute()
+        return res.data
+    except Exception:
+        return None
 
 
 def get_credits(user_id: str) -> int:
@@ -42,11 +51,17 @@ def get_credits(user_id: str) -> int:
 
 def init_user(user_id: str) -> int:
     """Initialise un nouvel utilisateur avec les crédits offerts (upsert)."""
-    _supabase.table("credits").upsert(
-        {"user_id": user_id, "solde": CREDITS_OFFERTS_INSCRIPTION},
-        on_conflict="user_id",
-        ignore_duplicates=True,
-    ).execute()
+    sb = _get_client()
+    if sb is None:
+        return CREDITS_OFFERTS_INSCRIPTION
+    try:
+        sb.table("credits").upsert(
+            {"user_id": user_id, "solde": CREDITS_OFFERTS_INSCRIPTION},
+            on_conflict="user_id",
+            ignore_duplicates=True,
+        ).execute()
+    except Exception:
+        pass
     return CREDITS_OFFERTS_INSCRIPTION
 
 
@@ -54,10 +69,16 @@ def add_credits(user_id: str, amount: int) -> int:
     """Ajoute des crédits (appelé par le webhook Stripe)."""
     current = get_credits(user_id)
     new_solde = current + amount
-    _supabase.table("credits").upsert(
-        {"user_id": user_id, "solde": new_solde},
-        on_conflict="user_id",
-    ).execute()
+    sb = _get_client()
+    if sb is None:
+        return new_solde
+    try:
+        sb.table("credits").upsert(
+            {"user_id": user_id, "solde": new_solde},
+            on_conflict="user_id",
+        ).execute()
+    except Exception:
+        pass
     return new_solde
 
 
@@ -65,22 +86,27 @@ def consume_credits(user_id: str, amount: int) -> tuple[bool, int]:
     """
     Tente de consommer `amount` crédits.
     Retourne (succès: bool, solde_restant: int).
-    Pas de race condition : lecture + écriture atomique via RPC Supabase.
     """
     current = get_credits(user_id)
     if current < amount:
         return False, current
     new_solde = current - amount
-    _supabase.table("credits").update(
-        {"solde": new_solde, "updated_at": "now()"}
-    ).eq("user_id", user_id).execute()
+    sb = _get_client()
+    if sb is None:
+        return True, new_solde
+    try:
+        sb.table("credits").update(
+            {"solde": new_solde, "updated_at": "now()"}
+        ).eq("user_id", user_id).execute()
+    except Exception:
+        pass
     return True, new_solde
 
 
 def count_valid_contacts(contacts: list) -> int:
     """
     Compte les contacts réellement valides reçus côté backend.
-    Sécurité anti-arnaque : on compte ce qu'on reçoit,
+    Sécurité anti-arnaque : on compte ce qu’on reçoit,
     pas ce que le client prétend avoir envoyé.
     """
     return sum(
